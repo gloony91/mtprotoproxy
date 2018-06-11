@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+
 import asyncio
+import uvloop
 import socket
 import urllib.parse
 import urllib.request
@@ -787,6 +789,8 @@ def loop_exception_handler(loop, context):
 
 
 def main():
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
     init_stats()
 
     if sys.platform == 'win32':
