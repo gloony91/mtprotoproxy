@@ -13,6 +13,7 @@ import random
 import binascii
 import sys
 
+
 try:
     from Crypto.Cipher import AES
     from Crypto.Util import Counter
@@ -48,6 +49,16 @@ except ImportError:
 
         mode = pyaes.AESModeOfOperationCBC(key, iv)
         return EncryptorAdapter(mode)
+
+
+try:
+    import resource
+    soft_fd_limit, hard_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard_fd_limit, hard_fd_limit))
+except (ValueError, OSError):
+    print("Failed to increase the limit of opened files", flush=True, file=sys.stderr)
+except ImportError:
+    pass
 
 
 import config
