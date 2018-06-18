@@ -12,6 +12,7 @@ import hashlib
 import random
 import binascii
 import sys
+import re
 
 
 try:
@@ -70,7 +71,10 @@ PREFER_IPV6 = getattr(config, "PREFER_IPV6", socket.has_ipv6)
 # disables tg->client trafic reencryption, faster but less secure
 FAST_MODE = getattr(config, "FAST_MODE", True)
 STATS_PRINT_PERIOD = getattr(config, "STATS_PRINT_PERIOD", 600)
-READ_BUF_SIZE = getattr(config, "READ_BUF_SIZE", 4096)
+PROXY_INFO_UPDATE_PERIOD = getattr(config, "PROXY_INFO_UPDATE_PERIOD", 60*60*24)
+READ_BUF_SIZE = getattr(config, "READ_BUF_SIZE", 16384)
+WRITE_BUF_SIZE = getattr(config, "WRITE_BUF_SIZE", 65536)
+CLIENT_KEEPALIVE = getattr(config, "CLIENT_KEEPALIVE", 60*30)
 AD_TAG = bytes.fromhex(getattr(config, "AD_TAG", ""))
 
 TG_DATACENTER_PORT = 443
@@ -85,18 +89,22 @@ TG_DATACENTERS_V6 = [
     "2001:67c:04e8:f004::a", "2001:b28:f23f:f005::a"
 ]
 
-TG_MIDDLE_PROXIES_V4 = [
-    ("149.154.175.50", 8888), ("149.154.162.38", 80), ("149.154.175.100", 8888),
-    ("91.108.4.136", 8888), ("91.108.56.181", 8888)
-]
+# This list will be updated in the runtime
+TG_MIDDLE_PROXIES_V4 = {
+    1: [("149.154.175.50", 8888)], -1: [("149.154.175.50", 8888)],
+    2: [("149.154.162.38", 80)], -2: [("149.154.162.38", 80)],
+    3: [("149.154.175.100", 8888)], -3: [("149.154.175.100", 8888)],
+    4: [("91.108.4.136", 8888)], -4: [("91.108.4.136", 8888)],
+    5: [("91.108.56.181", 8888)], -5: [("91.108.56.181", 8888)]
+}
 
-TG_MIDDLE_PROXIES_V6 = [
-    ("2001:0b28:f23d:f001:0000:0000:0000:000d", 8888),
-    ("2001:067c:04e8:f002:0000:0000:0000:000d", 80),
-    ("2001:0b28:f23d:f003:0000:0000:0000:000d", 8888),
-    ("2001:067c:04e8:f004:0000:0000:0000:000d", 8888),
-    ("2001:0b28:f23f:f005:0000:0000:0000:000d", 8888)
-]
+TG_MIDDLE_PROXIES_V6 = {
+    1: [("2001:b28:f23d:f001::d", 8888)], -1: [("2001:b28:f23d:f001::d", 8888)],
+    2: [("2001:67c:04e8:f002::d", 80)], -2: [("2001:67c:04e8:f002::d", 80)],
+    3: [("2001:b28:f23d:f003::d", 8888)], -3: [("2001:b28:f23d:f003::d", 8888)],
+    4: [("2001:67c:04e8:f004::d", 8888)], -4: [("2001:67c:04e8:f004::d", 8888)],
+    5: [("2001:b28:f23f:f005::d", 8888)], -5: [("2001:67c:04e8:f004::d", 8888)]
+}
 
 
 USE_MIDDLE_PROXY = (len(AD_TAG) == 16)
@@ -113,9 +121,11 @@ PREKEY_LEN = 32
 KEY_LEN = 32
 IV_LEN = 16
 HANDSHAKE_LEN = 64
-MAGIC_VAL_POS = 56
+PROTO_TAG_POS = 56
+DC_IDX_POS = 60
 
-MAGIC_VAL_TO_CHECK = b'\xef\xef\xef\xef'
+PROTO_TAG_ABRIDGED = b"\xef\xef\xef\xef"
+PROTO_TAG_INTERMEDIATE = b"\xee\xee\xee\xee"
 
 CBC_PADDING = 16
 PADDING_FILLER = b"\x04\x00\x00\x00"
@@ -306,16 +316,12 @@ class MTProtoCompactFrameStreamReader(LayeredStreamReaderBase):
 
 
 class MTProtoCompactFrameStreamWriter(LayeredStreamWriterBase):
-    def __init__(self, upstream, seq_no=0):
-        self.upstream = upstream
-        self.seq_no = seq_no
-
     def write(self, data):
         SMALL_PKT_BORDER = 0x7f
         LARGE_PKT_BORGER = 256 ** 3
 
         if len(data) % 4 != 0:
-            print_err("BUG: MTProtoFrameStreamWriter attempted to send msg with len %d" % len(msg))
+            print_err("BUG: MTProtoFrameStreamWriter attempted to send msg with len", len(data))
             return 0
 
         len_div_four = len(data) // 4
@@ -328,6 +334,24 @@ class MTProtoCompactFrameStreamWriter(LayeredStreamWriterBase):
         else:
             print_err("Attempted to send too large pkt len =", len(data))
             return 0
+
+
+class MTProtoIntermediateFrameStreamReader(LayeredStreamReaderBase):
+    async def read(self, buf_size):
+        msg_len_bytes = await self.upstream.readexactly(4)
+        msg_len = int.from_bytes(msg_len_bytes, "little")
+
+        if msg_len > 0x80000000:
+            msg_len -= 0x80000000
+
+        data = await self.upstream.readexactly(msg_len)
+
+        return data
+
+
+class MTProtoIntermediateFrameStreamWriter(LayeredStreamWriterBase):
+    def write(self, data):
+        return self.upstream.write(int.to_bytes(len(data), 4, 'little') + data)
 
 
 class ProxyReqStreamReader(LayeredStreamReaderBase):
@@ -352,7 +376,7 @@ class ProxyReqStreamReader(LayeredStreamReaderBase):
 
 
 class ProxyReqStreamWriter(LayeredStreamWriterBase):
-    def __init__(self, upstream, cl_ip, cl_port, my_ip, my_port):
+    def __init__(self, upstream, cl_ip, cl_port, my_ip, my_port, proto_tag):
         self.upstream = upstream
 
         if ":" not in cl_ip:
@@ -370,9 +394,15 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
         self.our_ip_port += int.to_bytes(my_port, 4, "little")
         self.out_conn_id = bytearray([random.randrange(0, 256) for i in range(8)])
 
+        if proto_tag == PROTO_TAG_ABRIDGED:
+            self.last_flag_byte = b"\x40"
+        elif proto_tag == PROTO_TAG_INTERMEDIATE:
+            self.last_flag_byte = b"\x20"
+        else:
+            self.last_flag_byte = b"\x00"
+
     def write(self, msg):
         RPC_PROXY_REQ = b"\xee\xf1\xce\x36"
-        FLAGS = b"\x08\x10\x02\x40"
         EXTRA_SIZE = b"\x18\x00\x00\x00"
         PROXY_TAG = b"\xae\x26\x1e\xdb"
         FOUR_BYTES_ALIGNER = b"\x00\x00\x00"
@@ -381,12 +411,18 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
             print_err("BUG: attempted to send msg with len %d" % len(msg))
             return 0
 
+        if msg.startswith(b"\x00" * 8):
+            flags = b"\x0a\x10\x02" + self.last_flag_byte
+        else:
+            flags = b"\x08\x10\x02" + self.last_flag_byte
+
         full_msg = bytearray()
-        full_msg += RPC_PROXY_REQ + FLAGS + self.out_conn_id + self.remote_ip_port
-        full_msg += self.our_ip_port + EXTRA_SIZE + PROXY_TAG
+        full_msg += RPC_PROXY_REQ + flags + self.out_conn_id
+        full_msg += self.remote_ip_port + self.our_ip_port + EXTRA_SIZE + PROXY_TAG
         full_msg += bytes([len(AD_TAG)]) + AD_TAG + FOUR_BYTES_ALIGNER
         full_msg += msg
 
+        self.first_flag_byte = b"\x08"
         return self.upstream.write(full_msg)
 
 
@@ -408,25 +444,25 @@ async def handle_handshake(reader, writer):
 
         decrypted = decryptor.decrypt(handshake)
 
-        check_val = decrypted[MAGIC_VAL_POS:MAGIC_VAL_POS+4]
-        if check_val != MAGIC_VAL_TO_CHECK:
+        proto_tag = decrypted[PROTO_TAG_POS:PROTO_TAG_POS+4]
+        if proto_tag not in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE):
             continue
 
-        dc_idx = abs(int.from_bytes(decrypted[60:62], "little", signed=True)) - 1
-        if dc_idx == 0:
-            continue
+        dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
         reader = CryptoWrappedStreamReader(reader, decryptor)
         writer = CryptoWrappedStreamWriter(writer, encryptor)
-        return reader, writer, user, dc_idx, enc_key + enc_iv
+        return reader, writer, proto_tag, user, dc_idx, enc_key + enc_iv
     return False
 
 
-async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
+async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
     RESERVED_NONCE_FIRST_CHARS = [b"\xef"]
     RESERVED_NONCE_BEGININGS = [b"\x48\x45\x41\x44", b"\x50\x4F\x53\x54",
                                 b"\x47\x45\x54\x20", b"\xee\xee\xee\xee"]
     RESERVED_NONCE_CONTINUES = [b"\x00\x00\x00\x00"]
+
+    dc_idx = abs(dc_idx) - 1
 
     if PREFER_IPV6:
         if not 0 <= dc_idx < len(TG_DATACENTERS_V6):
@@ -438,7 +474,8 @@ async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
         dc = TG_DATACENTERS_V4[dc_idx]
 
     try:
-        reader_tgt, writer_tgt = await asyncio.open_connection(dc, TG_DATACENTER_PORT)
+        reader_tgt, writer_tgt = await asyncio.open_connection(dc, TG_DATACENTER_PORT,
+                                                               limit=READ_BUF_SIZE)
     except ConnectionRefusedError as E:
         print_err("Got connection refused while trying to connect to", dc, TG_DATACENTER_PORT)
         return False
@@ -456,7 +493,7 @@ async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
             continue
         break
 
-    rnd[MAGIC_VAL_POS:MAGIC_VAL_POS+4] = MAGIC_VAL_TO_CHECK
+    rnd[PROTO_TAG_POS:PROTO_TAG_POS+4] = proto_tag
 
     if dec_key_and_iv:
         rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN] = dec_key_and_iv[::-1]
@@ -471,7 +508,7 @@ async def do_direct_handshake(dc_idx, dec_key_and_iv=None):
     enc_key, enc_iv = enc_key_and_iv[:KEY_LEN], enc_key_and_iv[KEY_LEN:]
     encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
 
-    rnd_enc = rnd[:MAGIC_VAL_POS] + encryptor.encrypt(rnd)[MAGIC_VAL_POS:]
+    rnd_enc = rnd[:PROTO_TAG_POS] + encryptor.encrypt(rnd)[PROTO_TAG_POS:]
 
     writer_tgt.write(rnd_enc)
     await writer_tgt.drain()
@@ -518,7 +555,12 @@ def set_keepalive(sock, interval=40, attempts=5):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, attempts)
 
 
-async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
+def set_bufsizes(sock, recv_buf=READ_BUF_SIZE, send_buf=WRITE_BUF_SIZE):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buf)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buf)
+
+
+async def do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port):
     START_SEQ_NO = -2
     NONCE_LEN = 16
 
@@ -536,17 +578,18 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
     use_ipv6_clt = (":" in cl_ip)
 
     if use_ipv6_tg:
-        if not 0 <= dc_idx < len(TG_MIDDLE_PROXIES_V6):
+        if dc_idx not in TG_MIDDLE_PROXIES_V6:
             return False
-        addr, port = TG_MIDDLE_PROXIES_V6[dc_idx]
+        addr, port = random.choice(TG_MIDDLE_PROXIES_V6[dc_idx])
     else:
-        if not 0 <= dc_idx < len(TG_MIDDLE_PROXIES_V4):
+        if dc_idx not in TG_MIDDLE_PROXIES_V4:
             return False
-        addr, port = TG_MIDDLE_PROXIES_V4[dc_idx]
+        addr, port = random.choice(TG_MIDDLE_PROXIES_V4[dc_idx])
 
     try:
-        reader_tgt, writer_tgt = await asyncio.open_connection(addr, port)
+        reader_tgt, writer_tgt = await asyncio.open_connection(addr, port, limit=READ_BUF_SIZE)
         set_keepalive(writer_tgt.get_extra_info("socket"))
+        set_bufsizes(writer_tgt.get_extra_info("socket"))
     except ConnectionRefusedError as E:
         print_err("Got connection refused while trying to connect to", addr, port)
         return False
@@ -642,30 +685,33 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
     if handshake_type != RPC_HANDSHAKE or handshake_peer_pid != SENDER_PID:
         return False
 
-    writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port)
+    writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port, proto_tag)
     reader_tgt = ProxyReqStreamReader(reader_tgt)
 
     return reader_tgt, writer_tgt
 
 
 async def handle_client(reader_clt, writer_clt):
+    set_keepalive(writer_clt.get_extra_info("socket"), CLIENT_KEEPALIVE)
+    set_bufsizes(writer_clt.get_extra_info("socket"))
+
     clt_data = await handle_handshake(reader_clt, writer_clt)
     if not clt_data:
         writer_clt.transport.abort()
         return
 
-    reader_clt, writer_clt, user, dc_idx, enc_key_and_iv = clt_data
+    reader_clt, writer_clt, proto_tag, user, dc_idx, enc_key_and_iv = clt_data
 
     update_stats(user, connects=1)
 
     if not USE_MIDDLE_PROXY:
         if FAST_MODE:
-            tg_data = await do_direct_handshake(dc_idx, dec_key_and_iv=enc_key_and_iv)
+            tg_data = await do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=enc_key_and_iv)
         else:
-            tg_data = await do_direct_handshake(dc_idx)
+            tg_data = await do_direct_handshake(proto_tag, dc_idx)
     else:
         cl_ip, cl_port = writer_clt.upstream.get_extra_info('peername')[:2]
-        tg_data = await do_middleproxy_handshake(dc_idx, cl_ip, cl_port)
+        tg_data = await do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port)
 
     if not tg_data:
         writer_clt.transport.abort()
@@ -686,8 +732,14 @@ async def handle_client(reader_clt, writer_clt):
         writer_clt.encryptor = FakeEncryptor()
 
     if USE_MIDDLE_PROXY:
-        reader_clt = MTProtoCompactFrameStreamReader(reader_clt)
-        writer_clt = MTProtoCompactFrameStreamWriter(writer_clt)
+        if proto_tag == PROTO_TAG_ABRIDGED:
+            reader_clt = MTProtoCompactFrameStreamReader(reader_clt)
+            writer_clt = MTProtoCompactFrameStreamWriter(writer_clt)
+        elif proto_tag == PROTO_TAG_INTERMEDIATE:
+            reader_clt = MTProtoIntermediateFrameStreamReader(reader_clt)
+            writer_clt = MTProtoIntermediateFrameStreamWriter(writer_clt)
+        else:
+            return
 
     async def connect_reader_to_writer(rd, wr, user):
         update_stats(user, curr_connects_x2=1)
@@ -732,6 +784,85 @@ async def stats_printer():
                 user, stat["connects"], stat["curr_connects_x2"] // 2,
                 stat["octets"] / 1000000))
         print(flush=True)
+
+
+async def update_middle_proxy_info():
+    async def make_https_req(url):
+        # returns resp body
+        SSL_PORT = 443
+        url_data = urllib.parse.urlparse(url)
+
+        HTTP_REQ_TEMPLATE = "\r\n".join(["GET %s HTTP/1.1", "Host: core.telegram.org",
+                                         "Connection: close"]) + "\r\n\r\n"
+        try:
+            reader, writer = await asyncio.open_connection(url_data.netloc, SSL_PORT, ssl=True)
+            req = HTTP_REQ_TEMPLATE % urllib.parse.quote(url_data.path)
+            writer.write(req.encode("utf8"))
+            data = await reader.read()
+            writer.close()
+
+            headers, body = data.split(b"\r\n\r\n", 1)
+            return body
+        except Exception:
+            return b""
+
+    async def get_new_proxies(url):
+        PROXY_REGEXP = re.compile(r"proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;")
+
+        ans = {}
+        try:
+            body = await make_https_req(url)
+        except Exception:
+            return ans
+
+        fields = PROXY_REGEXP.findall(body.decode("utf8"))
+        if fields:
+            for dc_idx, host, port in fields:
+                if host.startswith("[") and host.endswith("]"):
+                    host = host[1:-1]
+                dc_idx, port = int(dc_idx), int(port)
+                if dc_idx not in ans:
+                    ans[dc_idx] = [(host, port)]
+                else:
+                    ans[dc_idx].append((host, port))
+        return ans
+
+    PROXY_INFO_ADDR = "https://core.telegram.org/getProxyConfig"
+    PROXY_INFO_ADDR_V6 = "https://core.telegram.org/getProxyConfigV6"
+    PROXY_SECRET_ADDR = "https://core.telegram.org/getProxySecret"
+
+    global TG_MIDDLE_PROXIES_V4
+    global TG_MIDDLE_PROXIES_V6
+    global PROXY_SECRET
+
+    while True:
+        try:
+            v4_proxies = await get_new_proxies(PROXY_INFO_ADDR)
+            if not v4_proxies:
+                raise Exception("no proxy data")
+            TG_MIDDLE_PROXIES_V4 = v4_proxies
+        except Exception:
+            print_err("Error updating middle proxy list")
+
+        try:
+            v6_proxies = await get_new_proxies(PROXY_INFO_ADDR_V6)
+            if not v6_proxies:
+                raise Exception("no proxy data (ipv6)")
+            TG_MIDDLE_PROXIES_V6 = v6_proxies
+        except Exception:
+            print_err("Error updating middle proxy list for IPv6")
+
+        try:
+            secret = await make_https_req(PROXY_SECRET_ADDR)
+            if not secret:
+                raise Exception("no secret")
+            if secret != PROXY_SECRET:
+                PROXY_SECRET = secret
+                print_err("Middle proxy secret updated")
+        except Exception:
+            print_err("Error updating middle proxy secret, using old")
+
+        await asyncio.sleep(PROXY_INFO_UPDATE_PERIOD)
 
 
 def init_ip_info():
@@ -814,13 +945,17 @@ def main():
     stats_printer_task = asyncio.Task(stats_printer())
     asyncio.ensure_future(stats_printer_task)
 
+    if USE_MIDDLE_PROXY:
+        middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info())
+        asyncio.ensure_future(middle_proxy_updater_task)
+
     task_v4 = asyncio.start_server(handle_client_wrapper,
-                                   '0.0.0.0', PORT, loop=loop)
+                                   '0.0.0.0', PORT, limit=READ_BUF_SIZE, loop=loop)
     server_v4 = loop.run_until_complete(task_v4)
 
     if socket.has_ipv6:
         task_v6 = asyncio.start_server(handle_client_wrapper,
-                                       '::', PORT, loop=loop)
+                                       '::', PORT, limit=READ_BUF_SIZE, loop=loop)
         server_v6 = loop.run_until_complete(task_v6)
 
     try:
